@@ -1,5 +1,12 @@
 # Minerva project- clustering conflicts
 
+minerva_bucketing-replication folder has everything needed to replicate the study.
+
+data folder has raw data downloaded from PITF & PRIO website.
+
+output folder is used to store all model outputs.
+
+
 ## Instruction to replicate the study findings
 
 Order of scripts
