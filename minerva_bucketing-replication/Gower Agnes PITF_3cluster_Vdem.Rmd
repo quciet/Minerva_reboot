@@ -1,0 +1,517 @@
+---
+title: "Minerva Bucketing: Euclidean & Agnes"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    toc: yes
+    toc_depth: 3
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+```{r setup, include=TRUE, message=FALSE}
+library(tidyverse)        #for data management, manipulation, and visualization
+library(cluster)          #for PAM and Agnes clustering
+library(NbClust)          #for cluster count horserace
+library(janitor)          #for easy frequency tables with tabyl()
+library(factoextra)       #for cluster evaluation, distance, and PCA plots
+library(openxlsx)         #for write.xlsx()
+library(fmsb)             #for radar plots
+```
+
+Read in PITF data and IV Variables used in paper: 
+  
+```{r paper_vars, include=TRUE}
+df <- readxl::read_xlsx('data/PITF_2yrpeace_2yrlag.xlsx')
+df <- df %>% relocate(v2x_libdem, .after= polity_squared) %>% select(-polity_squared ) %>% rename(polity_squared = v2x_libdem)
+set5 <- c('polity_squared', 
+          'PopYouthBulgeBy15_new', 
+          'gdppc_ln',
+          'nAC_perc',
+          'imr_annual_mean_centered',
+          'sum_PDIS_EDIS')
+
+paper_vars_preferred <- set5
+```
+
+Scale all IVs that will be used in cluster analysis.  
+Filter the dataframe to only the observations that are complete.  
+Move the `country_year` variable to the index for better visualizations.  
+standardization used in agnes/daisy for numeric variables is using mean abs deviation
+Notice the difference in the scale function compared with Euclidean
+
+```{r make_cluster_data, include=TRUE}
+cluster_data <- df %>% 
+  select(c(country,year,country_year_onset,country_year_iv,paper_vars_preferred)) %>% 
+  filter(complete.cases(.)) %>%
+  #mutate_at(vars(polity_squared:sum_PDIS_EDIS), 
+  #          list(scale = ~as.numeric(scale(., center=TRUE, scale=meanabsdev(.))))) %>% 
+  #mutate_at(vars(polity_squared:sum_PDIS_EDIS), 
+  #          list(scale = ~as.numeric(scale(.)))) %>% 
+  mutate_at(vars(polity_squared:sum_PDIS_EDIS), 
+            list(scale = ~as.numeric(scale(., center=min(.), scale=max(.)-min(.))))) %>% 
+  rowid_to_column(.) %>% 
+  column_to_rownames('country_year_onset')
+
+```
+
+Now, the dataframe is prepared for generating a dissimilarity matrix. 
+
+## Notes on distance metric used  
+
+The manuscript presents the use of Euclidean distance for the primary distance metric. The `daisy()` function from the `cluster` package allows for all alternatives tested in the sensitivity analysis with the `metric =` argument. 
+
+```{r dist_matrix, include=TRUE}
+dist_matrix <- 
+  cluster::daisy(
+    cluster_data %>%
+      select(polity_squared:sum_PDIS_EDIS),
+    metric = 'gower')
+```
+
+```{r dist_matrix_plot, include=TRUE, fig.height=10}
+(dist_matrix_plot <- fviz_dist(dist_matrix, 
+                               gradient = list(low = "red", 
+                                               mid = "white", 
+                                               high = "blue")) + 
+    ggtitle('Gower',
+            subtitle = 'Civil War'))
+
+```
+
+## Linkage method of clustering  
+
+```{r nbclust, include=TRUE, fig.height=6}
+nbclust_result <- cluster_data %>% 
+  select(polity_squared_scale:sum_PDIS_EDIS_scale) %>% 
+  NbClust::NbClust(data = ., 
+                   diss = dist_matrix,
+                   distance = NULL,
+                   min.nc = 3,
+                   max.nc = 7,
+                   method = 'ward.D2',
+                   index = 'alllong')
+
+(horse_race_viz <- fviz_nbclust(nbclust_result) + 
+    labs(caption = 'Euclidean\nCivil Wars'))
+(elbow_plot <- fviz_nbclust(as.matrix(dist_matrix), FUNcluster = hcut, method = "wss" )) # 'silhouette' or "wss"
+```
+
+
+## Agglomerative Hierarchical Clustering (Agnes)
+
+```{r make_agnes, include=TRUE}
+set.seed(1234)
+cluster_agnes<- cluster::agnes(
+  dist_matrix, 
+  diss = TRUE,
+  #stand = FALSE,
+  #metric = 'euclidean',
+  method = "ward"
+)
+
+(dendro_viz <- fviz_dend(cluster_agnes, 
+                         k=3,
+                         palette='jco',
+                         repel=TRUE, 
+                         cex=.4) + 
+    ggtitle('Agnes - Gower distance'))
+```
+
+```{r cluster_agnes_groups_summary, include=TRUE}
+cluster_agnes_groups <- 
+  cutree(as.hclust(cluster_agnes), k=3) %>% 
+  as.data.frame(.) %>% 
+  rowid_to_column(.) %>% 
+  rename('agnes_cluster' = '.')
+
+cluster_agnes_groups_summary <- left_join(x=cluster_agnes_groups,
+                                             y=cluster_data,
+                                             by='rowid')
+
+cluster_agnes_groups_summary %>% 
+  select(2:4) -> agnes_set_5
+
+cluster_agnes_groups_summary_tabyl <- cluster_agnes_groups_summary %>%
+  tabyl(agnes_cluster)
+
+(cluster_agnes_groups_summary_tbl <- cluster_agnes_groups_summary %>% 
+    group_by(agnes_cluster) %>% 
+    summarise_at(vars(year, polity_squared:sum_PDIS_EDIS_scale),
+                 list(median = ~median(.),
+                      mean = ~mean(.),
+                      sd = ~sd(.))) %>% 
+    left_join(x=.,
+              y=cluster_agnes_groups_summary_tabyl,
+              by='agnes_cluster'))
+```
+
+## Partitioning Around Medoids (PAM) 
+
+```{r cluster_pam_groups_summary, include=TRUE}
+cluster_pam <- cluster::pam(dist_matrix, 3, diss = TRUE)
+
+cluster_pam_groups <- as.data.frame(cluster_pam$clustering) %>% 
+  rowid_to_column(.) %>% 
+  rename('pam_cluster' = 'cluster_pam$clustering')
+
+cluster_pam_groups_summary <- left_join(x=cluster_pam_groups,
+                                           y=cluster_data,
+                                           by='rowid')
+
+cluster_pam_groups_summary %>% 
+  select(2:4) -> PAM_set_5
+
+cluster_pam_groups_summary_tabyl <- cluster_pam_groups_summary %>%
+  tabyl(pam_cluster)
+
+(cluster_pam_groups_summary_tbl <- cluster_pam_groups_summary %>% 
+    group_by(pam_cluster) %>% 
+    summarise_at(vars(year, polity_squared:sum_PDIS_EDIS_scale),
+                 list(median = ~median(.),
+                      mean = ~mean(.),
+                      sd = ~sd(.))) %>% 
+    left_join(x=.,
+              y=cluster_pam_groups_summary_tabyl,
+              by='pam_cluster'))
+```
+
+# Cluster membership
+
+```{r join_agnes_pam_membership, include=TRUE}
+joined_set <- left_join(x=PAM_set_5,
+                        y=agnes_set_5,
+                        by=c('country', 'year')) %>% 
+  select(country, year, everything())
+```
+
+# Similarity analysis  
+
+```{r most_similar, include=TRUE}
+(most_similar <- as.data.frame(as.matrix(dist_matrix)) %>% 
+    rownames_to_column() %>% 
+    gather(country_b, similarity, 2:last_col()) %>% 
+    filter(similarity != 0) %>% 
+    group_by(rowname) %>% 
+    slice(which.min(similarity)) %>% 
+    arrange(rowname))
+```
+
+# Analysis of cluster centers  
+
+## Agnes  
+
+```{r agnes_center_distance, include=TRUE}
+(agnes_center_distance <- cluster_agnes_groups_summary_tbl  %>% 
+    mutate(country = 'Cluster center estimate') %>% 
+    select(country, agnes_cluster, contains('median')) %>% 
+    select(-contains('scale')) %>% 
+    gather(variable, value, 3:9) %>% 
+    separate(., variable, into = c('variable', 'median'), sep='_median') %>% 
+    select(-median) %>% 
+    spread(variable, value) %>% 
+    bind_rows(x=.,
+              y=cluster_data %>% 
+                mutate(agnes_cluster = NA) %>% 
+                select(-c(rowid, country_year_iv, polity_squared_scale:sum_PDIS_EDIS_scale))) %>% 
+    rowid_to_column(.) %>% 
+    mutate(country_year = ifelse(country == 'Cluster center estimate',
+                                 paste(rowid, country, year, sep = '_'),
+                                 paste(country, year, sep = '_'))) %>% 
+    column_to_rownames('country_year'))
+```
+
+```{r dist_matrix_agnes_center, include=TRUE}
+
+agnes_center_distance <- agnes_center_distance %>% 
+  mutate_at(vars(gdppc_ln:sum_PDIS_EDIS), 
+            list(scale = ~as.numeric(scale(., center=min(.), scale=max(.)-min(.)))))
+  #mutate_at(vars(gdppc_ln:sum_PDIS_EDIS), 
+  #          list(scale = ~as.numeric(scale(.))))
+  #mutate_at(vars(gdppc_ln:sum_PDIS_EDIS), 
+  #          list(scale = ~as.numeric(scale(., center=TRUE, scale=meanabsdev(.)))))
+
+dist_matrix_agnes_center <- 
+  cluster::daisy(
+    agnes_center_distance %>%
+      select(gdppc_ln_scale:sum_PDIS_EDIS_scale),
+    stand = FALSE,
+    metric = 'gower')
+
+as.data.frame(as.matrix(dist_matrix_agnes_center)) %>% 
+  rownames_to_column()
+```
+
+
+```{r agnes_center, include=TRUE}
+center_name <- rownames(agnes_center_distance)[1:3]
+
+(agnes_center <- as.data.frame(as.matrix(dist_matrix_agnes_center)) %>% 
+    rownames_to_column() %>% 
+    gather(country_b, similarity, 2:last_col()) %>% 
+    filter(similarity != 0) %>% 
+    group_by(rowname) %>% 
+    slice(which.min(similarity)) %>% 
+    arrange(rowname) %>% 
+    filter(rowname %in% center_name))
+
+(agnes_center_2 <- cluster_data %>% 
+    rownames_to_column() %>% 
+    inner_join(x=.,
+               y=agnes_center,
+               by=c('rowname' = 'country_b')))
+```
+
+```{r medoid_characteristics_agnes, include=TRUE}
+(medoid_characteristics_agnes <- agnes_set_5 %>% 
+    inner_join(x=.,
+               y=agnes_center_2,
+               by=c('country', 'year')) %>% 
+    select(agnes_cluster, rowname, everything()) %>% 
+    select(-c(rowname.y, similarity)) %>% 
+    arrange(agnes_cluster))
+```
+
+```{r agnes_center_3, include=TRUE}
+(agnes_center_3 <- agnes_set_5 %>% 
+    inner_join(x=.,
+               y=agnes_center_2,
+               by=c('country', 'year')) %>% 
+    select(rowname, agnes_cluster))
+```
+
+## PAM  
+
+```{r pam_medoids, include=TRUE}
+(pam_medoids <- cluster_pam$medoids %>% 
+    as.data.frame() %>%
+    rowid_to_column() %>% 
+    rename('pam_cluster' = 'rowid',
+           'rowname' = '.'))
+```
+
+```{r medoid_characteristics_PAM, include=TRUE}
+(medoid_characteristics_PAM <- cluster_data %>% 
+    rownames_to_column() %>% 
+    filter(rowname %in% cluster_pam$medoids) %>% 
+    left_join(x=.,
+              y=pam_medoids,
+              by='rowname') %>% 
+    select(pam_cluster, everything()) %>% 
+    arrange(pam_cluster))
+```
+
+# Most dissimilar from same cluster
+
+## Agnes  
+
+```{r most_dissimilar_pair_in_cluster_agnes, include=TRUE}
+(most_dissimilar_pair_in_cluster_agnes <- agnes_set_5 %>% 
+    mutate(rowname = paste(country, year, sep = '_')) %>% 
+    select(rowname, agnes_cluster))
+```
+
+```{r most_dissimilar_same_clust_agnes, include=TRUE}
+(most_dissimilar_same_clust_agnes <- as.data.frame(as.matrix(dist_matrix)) %>% 
+    rownames_to_column() %>% 
+    gather(country_b, similarity, 2:last_col()) %>% 
+    filter(similarity != 0) %>% 
+    left_join(x=.,
+              y=most_dissimilar_pair_in_cluster_agnes,
+              by=c('country_b' = 'rowname')) %>% 
+    semi_join(x=.,
+              y=agnes_center_3,
+              by=c('rowname', 'agnes_cluster')) %>% 
+    group_by(rowname, agnes_cluster) %>% 
+    slice(which.min(-similarity)) %>% 
+    arrange(agnes_cluster))
+```
+
+## PAM  
+
+```{r most_dissimilar_pair_in_cluster, include=TRUE}
+(most_dissimilar_pair_in_cluster <- PAM_set_5 %>% 
+    mutate(rowname = paste(country, year, sep = '_')) %>% 
+    select(rowname, pam_cluster))
+```
+
+```{r most_dissimilar_same_clust_PAM, include=TRUE}
+(most_dissimilar_same_clust_PAM <- as.data.frame(as.matrix(dist_matrix)) %>% 
+    rownames_to_column() %>% 
+    gather(country_b, similarity, 2:ncol(.)) %>% 
+    filter(similarity != 0) %>% 
+    left_join(x=.,
+              y=most_dissimilar_pair_in_cluster,
+              by=c('country_b' = 'rowname')) %>% 
+    semi_join(x=.,
+              y=pam_medoids,
+              by=c('rowname', 'pam_cluster')) %>% 
+    group_by(rowname, pam_cluster) %>% 
+    slice(which.min(-similarity)) %>% 
+    arrange(rowname))
+```
+# Visualizing cluster meaning  
+
+```{r build_spider_plot_data, include=TRUE}
+df_cluster_summary <- cluster_agnes_groups_summary_tbl %>% 
+  select(agnes_cluster, contains('mean')) %>%
+  select(agnes_cluster, contains('scale')) %>% 
+  select(-c(imr_annual_mean_centered_scale_median,
+            imr_annual_mean_centered_scale_sd)) %>%  
+  gather(variable, value, 2:7)
+
+df_cluster_summary_2 <- df_cluster_summary %>% 
+  spread(variable, value)
+
+df_cluster_summary_minmax <- df_cluster_summary %>% 
+  group_by(variable) %>% 
+  summarise(min = min(value),
+            max = max(value)) %>% 
+  gather(trans, value, 2:3) %>% 
+  spread(variable, value) %>% 
+  select(-trans)
+
+df_cluster_summary_bind <- bind_rows(df_cluster_summary_minmax, 
+                                     df_cluster_summary_2) %>%
+  select(-agnes_cluster) %>% 
+  rename('GDP per capita' = 'gdppc_ln_scale_mean',
+         'Infant Mortality Rate' = 'imr_annual_mean_centered_scale_mean',
+         'Polity squared' = 'polity_squared_scale_mean',
+         'Discrimination' = 'sum_PDIS_EDIS_scale_mean',
+         'Border conflicts' = 'nAC_perc_scale_mean',
+         'Youth bulge' = 'PopYouthBulgeBy15_new_scale_mean')
+(df_cluster_summary_bind)
+```
+
+```{r global_min_for_spiderplot, include=TRUE}
+(global_min <- cluster_data %>% 
+    #select(country, year, all_of(set5)) %>% 
+    #mutate_at(vars(polity_squared:sum_PDIS_EDIS), 
+    #          list(scale = ~as.numeric(scale(.)))) %>% 
+    group_by() %>% 
+    summarise_at(vars(polity_squared_scale:sum_PDIS_EDIS_scale),
+                 list(min = ~min(., na.rm = TRUE))) %>% 
+    rename('GDP per capita' = 'gdppc_ln_scale_min',
+           'Infant Mortality Rate' = 'imr_annual_mean_centered_scale_min',
+           'Polity squared' = 'polity_squared_scale_min',
+           'Discrimination' = 'sum_PDIS_EDIS_scale_min',
+           'Border conflicts' = 'nAC_perc_scale_min',
+           'Youth bulge' = 'PopYouthBulgeBy15_new_scale_min'))
+```
+```{r global_max_for_spiderplot, include=TRUE}
+(global_max <- cluster_data %>% 
+    #select(country, year, all_of(set5)) %>% 
+    #mutate_at(vars(polity_squared:sum_PDIS_EDIS), 
+    #          list(scale = ~as.numeric(scale(.)))) %>% 
+    group_by() %>% 
+    summarise_at(vars(polity_squared_scale:sum_PDIS_EDIS_scale),
+                 list(max = ~max(., na.rm = TRUE))) %>% 
+    rename('GDP per capita' = 'gdppc_ln_scale_max',
+           'Infant Mortality Rate' = 'imr_annual_mean_centered_scale_max',
+           'Polity squared' = 'polity_squared_scale_max',
+           'Discrimination' = 'sum_PDIS_EDIS_scale_max',
+           'Border conflicts' = 'nAC_perc_scale_max',
+           'Youth bulge' = 'PopYouthBulgeBy15_new_scale_max'))
+```
+
+
+```{r global_mean_for_spiderplot, include=TRUE}
+(global_mean <- cluster_data %>% 
+    #select(country, year, all_of(set5)) %>% 
+    #mutate_at(vars(polity_squared:sum_PDIS_EDIS), 
+    #          list(scale = ~as.numeric(scale(.)))) %>% 
+    group_by() %>% 
+    summarise_at(vars(polity_squared_scale:sum_PDIS_EDIS_scale),
+                 list(mean = ~mean(., na.rm = TRUE))) %>% 
+    rename('GDP per capita' = 'gdppc_ln_scale_mean',
+           'Infant Mortality Rate' = 'imr_annual_mean_centered_scale_mean',
+           'Polity squared' = 'polity_squared_scale_mean',
+           'Discrimination' = 'sum_PDIS_EDIS_scale_mean',
+           'Border conflicts' = 'nAC_perc_scale_mean',
+           'Youth bulge' = 'PopYouthBulgeBy15_new_scale_mean'))
+```
+
+```{r spider_plot_clust1, include=TRUE, fig.height=6}
+spider_plot_clust1 <- radarchart(
+  bind_rows(df_cluster_summary_bind[1:3,], global_mean), 
+  axistype=1,
+  #custom polygon
+  pcol=c(rgb(0.2,0.5,0.5,0.4),
+         rgb(0.5,0.5,0.5,0.3)), 
+  pfcol=c(rgb(0.2,0.5,0.5,0.4),
+          rgb(0.5,0.5,0.5,0.2)), 
+  plwd=c(4,2), plty=c(1,2),
+  #custom the grid
+  cglcol="grey", 
+  cglty=1, axislabcol="grey", 
+  cglwd=0.8,
+  #custom labels
+  vlcex=0.8)
+legend(x=-1.75, y=1.25, 
+       legend = c('Cluster1'), 
+       bty = "n", pch=20, col=rgb(0.2,0.5,0.5,0.4), 
+       text.col = 'black', cex=1, pt.cex=3)
+```
+
+
+```{r spider_plot_clust2, include=TRUE, fig.height=6}
+spider_plot_clust2 <- radarchart(
+  bind_rows(df_cluster_summary_bind[c(1,2,4),], global_mean), 
+  axistype=1, 
+  #custom polygon
+  pcol= c(rgb(0.8,0.2,0.5,0.4),
+          rgb(0.5,0.5,0.5,0.3)), 
+  pfcol= c(rgb(0.8,0.2,0.5,0.4),
+           rgb(0.5,0.5,0.5,0.2)), 
+  plwd=c(4,2), plty=c(1,2),
+  #custom the grid
+  cglcol="grey", 
+  cglty=1, axislabcol="grey", 
+  cglwd=0.8,
+  #custom labels
+  vlcex=0.8)
+legend(x=-1.75, y=1.25, 
+       legend = 'Cluster2', 
+       bty = "n", pch=20, col=rgb(0.8,0.2,0.5,0.4), text.col = 'black', cex=1, pt.cex=3)
+```
+
+
+
+```{r spider_plot_clust3, include=TRUE, fig.height=6}
+spider_plot_clust3 <- radarchart(
+  bind_rows(df_cluster_summary_bind[c(1,2,5),], global_mean), 
+  axistype=1, 
+  #custom polygon
+  pcol= c(rgb(0.7,0.5,0.1,0.4),
+          rgb(0.5,0.5,0.5,0.3)),
+  pfcol= c(rgb(0.7,0.5,0.1,0.4),
+           rgb(0.5,0.5,0.5,0.2)), 
+  plwd=c(4,2), plty=c(1,2),
+  #custom the grid
+  cglcol="grey", 
+  cglty=1, axislabcol="grey", 
+  cglwd=0.8,
+  #custom labels
+  vlcex=0.8)
+legend(x=-1.75, y=1.25, 
+       legend = 'Cluster3', 
+       bty = "n", pch=20, col=rgb(0.7,0.5,0.1,0.4), text.col = 'black', cex=1, pt.cex=3)
+```
+
+
+
+# Compiling Excel of results for analysis
+
+```{r compile_results, include=TRUE}
+compile_results <- list('3clust_agnes' = cluster_agnes_groups_summary_tbl,
+                        '3clust_PAM' = cluster_pam_groups_summary_tbl,
+                        'membership' = joined_set,
+                        'similarity' = most_similar,
+                        'most_dissimilar_same_clust' = most_dissimilar_same_clust_agnes,
+                        'most_dissimilar_same_clust_PAM' = most_dissimilar_same_clust_PAM,
+                        'medoid_characteristics_PAM' = medoid_characteristics_PAM,
+                        'medoid_characteristics_agnes' = medoid_characteristics_agnes)
+
+write.xlsx(compile_results, file='.//output/3clust_gower_pitf_vdem.xlsx', overwrite=TRUE)
+```
