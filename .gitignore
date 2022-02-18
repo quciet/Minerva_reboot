@@ -1,7 +1,6 @@
 # Excel temp file
-~$*.xls*
-# Excel Backup File
-*.xlk
+~$*.xls
+~$*.xlsx
 
 # Python check points
 .ipynb_checkpoints
