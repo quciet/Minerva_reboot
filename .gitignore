@@ -1,3 +1,8 @@
+# Excel temp file
+~$*.xls*
+# Excel Backup File
+*.xlk
+
 # Python check points
 .ipynb_checkpoints
 
